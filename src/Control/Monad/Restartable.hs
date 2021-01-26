@@ -9,44 +9,42 @@ module Control.Monad.Restartable
   , runRestartable
   ) where
 
-import Control.Monad   (liftM, ap)
+import Control.Monad   (liftM, ap, (>=>))
 import Data.Persistent
 import System.IO       (Handle, IOMode(ReadWriteMode), withFile)
 
-data Free f a = Pure a
-              | Impure (f (Free f a))
+data Freer f a where
+  Pure   :: a -> Freer f a
+  Impure :: f x -> (x -> Freer f a) -> Freer f a
 
-instance Functor f => Functor (Free f) where
+instance Functor (Freer f) where
   fmap = liftM
 
-instance Functor f => Applicative (Free f) where
+instance Applicative (Freer f) where
   pure = Pure
   (<*>) = ap
 
-instance Functor f => Monad (Free f) where
-  (Pure a) >>= f = f a
-  (Impure i) >>= f = Impure ((>>= f) <$> i)
+instance Monad (Freer f) where
+  (Pure a)      >>= g = g a
+  (Impure fx f) >>= g = Impure fx (f >=> g)
 
-liftF :: Functor f => f a -> Free f a
-liftF command = Impure (Pure <$> command)
+liftF :: f a -> Freer f a
+liftF command = Impure command Pure
 
-interpret :: (Functor f, Monad m) => (forall x. f x -> m x) -> Free f a -> m a
+interpret :: Monad m => (forall x. f x -> m x) -> Freer f a -> m a
 interpret nt = go
   where
     go = \case
-      Pure a    -> pure a
-      Impure fx -> nt fx >>= go
+      Pure a         -> pure a
+      Impure fx cont -> nt fx >>= (go . cont)
 
-data RestartableF next where
-  Step :: Persistent a => String -> IO a -> (a -> next) -> RestartableF next
+data RestartableF a where
+  Step :: Persistent a => String -> IO a -> RestartableF a
 
-instance Functor RestartableF where
-  fmap g (Step name act f) = Step name act (g . f)
-
-type Restartable = Free RestartableF
+type Restartable = Freer RestartableF
 
 step :: Persistent a => String -> IO a -> Restartable a
-step name act = liftF $ Step name act id
+step name act = liftF $ Step name act
 
 runRestartable :: forall a . FilePath -> Restartable a -> IO a
 runRestartable path restartable = withFile path ReadWriteMode run
@@ -56,14 +54,14 @@ runRestartable path restartable = withFile path ReadWriteMode run
       where
         go :: RestartableF b -> IO b
         go = \case
-          Step name act cont -> do
+          Step name act -> do
             maybeA <- restore handle
             case maybeA of
               Just a -> do
                 putStrLn $ "step " <> name <> " already completed"
-                pure $ cont a
+                pure a
               Nothing -> do
                 putStrLn $ "running step " <> name
                 a <- act
                 save handle a
-                pure $ cont a
+                pure a
