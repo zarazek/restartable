@@ -1,0 +1,537 @@
+\documentclass[8pt]{beamer}
+
+\usetheme{Warsaw}
+
+\usepackage[utf8]{inputenc}
+\usepackage[OT4]{fontenc}
+
+\title{Free monads in practice}
+
+\author{Wojciech~Wiśniewski\inst{1}}
+
+\institute
+{
+  \inst{1} FPComplete
+}
+
+\date{March 2023}
+
+\begin{document}
+
+\begin{frame}
+\titlepage
+\end{frame}
+
+\begin{frame}{Problem}
+\protect\hypertarget{problem}{}
+We need to register the user in the system. \\~\\
+
+To do this, we need to follow a sequence of steps:
+\begin{itemize}
+  \item check whether there is a user account in service A
+  \item set up an account in service B (or use an existing account)
+  \item using the account identifier from service A, send a SMS with the PIN to the user
+  \item receive PIN confirmation from the user
+  \item \ldots{}
+\end{itemize}
+
+\end{frame}
+
+\begin{frame}{Problem continued}
+\protect\hypertarget{problem-continued}{}
+Each of these steps may fail (network errors, service restart, errors in
+the code\ldots). In addition, our program can be restarted at any time. \\~\\
+
+We would like to be able to resume registration procedure from the point
+it was interrupted. \\~\\
+
+We would like our restartable program not to be too different from the
+ordinary one written in IO: we allow restartable operations to require
+annotations, but apart from that we want to use the usual do-notation.
+\end{frame}
+
+\begin{frame}[fragile]{Custom monad solution}
+\protect\hypertarget{custom-monad-solution}{}
+Imagine we have type \texttt{Restartable a} and \texttt{Monad} instance for
+this type. \\~\\
+
+Lets imagine we have function \texttt{step :: String -\textgreater{} IO a
+-\textgreater{} Restartable a}, which we will use to label restartable
+operations. \\~\\
+
+Let's make a class and functions to write and read data from a file:
+
+\begin{verbatim}
+class Persistent a where
+  serialize :: a -> String  
+  deserialize :: String -> a
+
+save :: Persistent a => Handle -> a -> IO ()
+save handle a = hPutStrLn handle $ serialize a
+
+restore :: Persistent a => Handle -> IO (Maybe a)
+restore handle = do
+  eof <- hIsEOF handle
+  if eof then
+    pure Nothing
+  else
+    Just . deserialize <$> hGetLine handle
+\end{verbatim}
+\end{frame}
+
+\begin{frame}{Custom monad solution continued}
+\protect\hypertarget{custom-monad-solution-continued}{}
+Imagine we also have function \texttt{runRestartable :: FilePath
+-\textgreater{} Restartable a -\textgreater{} IO a}, to run our probram
+in \texttt{IO}
+\end{frame}
+
+\begin{frame}[fragile]{Our own bespoke Restartable monad}
+\protect\hypertarget{our-own-bespoke-restartable-monad}{}
+Description of restartable operation:
+
+\begin{verbatim}
+data Restartable a where
+  Step :: Persistent a => String -> IO a -> Restartable a
+
+step :: String -> IO a -> Restartable a
+step = Step
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Our own bespoke Restartable monad: instances}
+\protect\hypertarget{our-own-bespoke-restartable-monad-instances}{}
+We add constructors, which ``capture'' methods from \texttt{Monad} and
+\texttt{Applicative} classes:
+
+\begin{verbatim}
+data Restartable a where
+  Step :: Persistent a => String -> IO a -> Restartable a
+  Pure :: a -> Restartable a
+  Bind :: Restartable x -> (x -> Restartable a) -> Restartable a
+
+instance Applicative Restartable where
+  pure = Pure
+
+instance Monad Restartable where
+  (>>=) = Bind
+
+step :: String -> IO a -> Restartable a
+step = Step
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Our own bespoke Restartable monad: instances
+continued}
+\protect\hypertarget{our-own-bespoke-restartable-monad-instances-continued}{}
+Other methods are defined in terms of \texttt{Monad} instance:
+
+\begin{verbatim}
+data Restartable a where
+  Step :: Persistent a => String -> IO a -> Restartable a
+  Pure :: a -> Restartable a
+  Bind :: Restartable x -> (x -> Restartable a) -> Restartable a
+
+instance Functor Restartable where
+  fmap = liftM
+
+instance Applicative Restartable where
+  pure = Pure
+  (<*>) = ap
+
+instance Monad Restartable where
+  (>>=) = Bind
+
+step :: String -> IO a -> Restartable a
+step = Step
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Our own bespoke Restartable monad: interpreter}
+\protect\hypertarget{our-own-bespoke-restartable-monad-interpreter}{}
+\texttt{runRestartable} function (notice that \texttt{go} function is
+recursive):
+
+\begin{verbatim}
+runRestartable :: forall a . FilePath -> Restartable a -> IO a
+runRestartable path restartable = withFile path ReadWriteMode run
+  where
+    run :: Handle -> IO a
+    run handle = go restartable
+      where
+        go :: Restartable b -> IO b
+        go = \case
+          Step name act -> do
+            maybeA <- restore handle
+            case maybeA of
+              Just a -> do
+                putStrLn $ "step " <> name <> " already completed"
+                pure a
+              Nothing -> do
+                putStrLn $ "running step " <> name
+                a <- act
+                save handle a
+                pure a
+          Pure a ->
+            pure a
+          Bind act f ->
+            go act >>= (go . f)
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Digression about laws}
+\protect\hypertarget{digression-about-laws}{}
+Simply ``capturing'' class methods can result in unlawfull instances. \\~\\
+
+Let's see this in a simpler example of a free monoid:
+
+\begin{verbatim}
+class Monoid a where
+  mempty :: a
+  mappend :: a -> a -> a
+
+data FreeMonoid a = Embed a | Mempty | Mappend (FreeMonoid a) (FreeMonoid a)
+
+instance Monoid (FreeMonoid a) where
+  mempty = Mempty
+  mappend = Mappend
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Digression about laws continued}
+\protect\hypertarget{digression-about-laws-continued}{}
+\texttt{FreeMonoid} is violating the associativity law:
+
+\begin{verbatim}
+(a `mappend` b) `mappend` c /= a `mappend` (b `mappend` c)
+\end{verbatim}
+
+\begin{verbatim}
+         *            *
+        / \          / \
+       *   c   /=   a   *
+      / \              / \
+     a   b            b   c
+\end{verbatim}
+
+It ``remembers too much'': we are only interested in the order of leaves
+in the tree, regardless of its construction history. Lawfull free monoid
+is a list:
+
+\begin{verbatim}
+instance Monoid [a] where
+  mempty = []
+  mappend = (++)
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Digression about laws continued further}
+\protect\hypertarget{digression-about-laws-continued-further}{}
+Our ``Monad'' instance for \texttt{Restartable} is also unlawfull, i. e.
+it violates this law:
+
+\begin{verbatim}
+pure a >>= f == f a
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Free monad}
+\protect\hypertarget{free-monad}{}
+We want to have lawfull monad. \\~\\
+
+In order to achieve this we separate the operations needed in every monad
+(\texttt{pure}, \texttt{\textgreater\textgreater=}) from those specific
+to our monad. \\~\\
+
+Common part:
+
+\begin{verbatim}
+data Free f a = Pure a
+              | Impure (f (Free f a)) -- alternatively: Impure (Fix (Free f))
+
+instance Functor f => Functor (Free f) where
+  fmap = liftM -- implemented in terms of Monad
+
+instance Functor f => Applicative (Free f) where
+  pure = Pure
+  (<*>) = ap -- implemented in terms Monad
+
+instance Functor f => Monad (Free f) where
+  (Pure a) >>= f = f a
+  (Impure i) >>= f = Impure ((>>= f) <$> i)
+\end{verbatim}
+
+Notice that \texttt{Monad} instance for \texttt{Free f} reqires \texttt{f}
+to be as \texttt{Functor}
+\end{frame}
+
+\begin{frame}[fragile]{Free monad continued}
+\protect\hypertarget{free-monad-continued}{}
+
+\begin{verbatim}
+liftF :: Functor f => f a -> Free f a
+liftF command = Impure (Pure <$> command)
+
+interpret :: (Functor f, Monad m) => (forall x. f x -> m x) -> Free f a -> m a
+interpret nt = go
+  where
+    go = \case
+      Pure a    -> pure a
+      Impure fx -> nt fx >>= go
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Free monad: operation specific to Restartable}
+\protect\hypertarget{free-monad-operation-specific-to-restartable}{}
+Let's try to define \texttt{RestartableF} type:
+
+\begin{verbatim}
+type Restartable = Free RestartableF
+
+data RestartableF a where
+  Step :: Persistent a => String -> IO a -> Restartable a
+
+instance Functor RestartableF where
+  fmap f = ???
+\end{verbatim}
+
+The \texttt{Monad} instance for \texttt{Free f} requires \texttt{f} to be a
+functor, but we can't turn \texttt{RestartableF} into a functor because of
+constraint \texttt{Persistent a}. \\~\\
+
+Is it a dead end?
+\end{frame}
+
+\begin{frame}[fragile]{Make functor from any type with this one weird
+trick}
+\protect\hypertarget{make-functor-from-any-type-with-this-one-weird-trick}{}
+Let's use the same trick as at the beginning: let's ``capture'' the
+function provided in \texttt{fmap} in our data type:
+
+\begin{verbatim}
+data RestartableF next where
+  Step :: Persistent a => String -> IO a -> (a -> next) -> Restartable next
+
+instance Functor RestartableF where
+  fmap g (Step name act f) = Step name act (g . f)
+
+step :: Persistent a => String -> IO a -> Restartable a
+step name act = liftF $ Step name act id
+\end{verbatim}
+
+This trick is known under fancy name of co-Yoneda. This is the
+continuation passing style variant (note how \texttt{step} function sets
+an empty continuation \texttt{id}).
+\end{frame}
+
+\begin{frame}[fragile]{Free monad: interpreter}
+\protect\hypertarget{free-monad-interpreter}{}
+Note that \texttt{go} function is not recursive any more (we factored out
+recursion to \texttt{Free} type and \texttt{interpret} function):
+
+\begin{verbatim}
+runRestartable :: forall a . FilePath -> Restartable a -> IO a
+runRestartable path restartable = withFile path ReadWriteMode run
+  where
+    run :: Handle -> IO a
+    run handle = interpret go restartable
+      where
+        go :: RestartableF b -> IO b
+        go = \case
+          Step name act cont -> do
+            maybeA <- restore handle
+            case maybeA of
+              Just a -> do
+                putStrLn $ "step " <> name <> " already completed"
+                pure $ cont a
+              Nothing -> do
+                putStrLn $ "running step " <> name
+                a <- act
+                save handle a
+                pure $ cont a
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Freer monad}
+\protect\hypertarget{freer-monad}{}
+We can build the co-Yoneda trick into our \texttt{Free(r)} type.
+Additional benefits:
+\begin{itemize}
+  \item we get rid of the requirement that our \texttt{f} must be a functor
+  \item we get rid of continuation passing style in our code
+\end{itemize}
+
+\begin{verbatim}
+data Freer f a where
+  Pure   :: a -> Freer f a
+  Impure :: f x -> (x -> Freer f a) -> Freer f a
+
+instance Monad (Freer f) where
+  (Pure a)      >>= g = g a
+  (Impure fx f) >>= g = Impure fx (f >=> g)
+
+liftF :: f a -> Freer f a
+liftF command = Impure command Pure
+
+interpret :: Monad m => (forall x. f x -> m x) -> Freer f a -> m a
+interpret nt = go
+  where
+    go = \case
+      Pure a         -> pure a
+      Impure fx cont -> nt fx >>= (go . cont)
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Freer monad: operation specific to Restartable}
+\protect\hypertarget{freer-monad-operation-specific-to-restartable}{}
+\texttt{RestartableF} no longer need to be a functor and we get rid of the
+continuation passing style from our code:
+
+\begin{verbatim}
+data RestartableF a where
+  Step :: Persistent a => String -> IO a -> RestartableF a
+
+type Restartable = Freer RestartableF
+
+step :: Persistent a => String -> IO a -> Restartable a
+step name act = liftF $ Step name act
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Freer monad: interpreter}
+\protect\hypertarget{freer-monad-interpreter}{}
+\begin{verbatim}
+runRestartable :: forall a . FilePath -> Restartable a -> IO a
+runRestartable path restartable = withFile path ReadWriteMode run
+  where
+    run :: Handle -> IO a
+    run handle = interpret go restartable
+      where
+        go :: RestartableF b -> IO b
+        go = \case
+          Step name act -> do
+            maybeA <- restore handle
+            case maybeA of
+              Just a -> do
+                putStrLn $ "step " <> name <> " already completed"
+                pure a
+              Nothing -> do
+                putStrLn $ "running step " <> name
+                a <- act
+                save handle a
+                pure a
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Free monad: analogy with list / tree}
+\protect\hypertarget{free-monad-analogy-with-list-tree}{}
+Free monad resembles list a little bit:
+
+\begin{verbatim}
+data List a = Nil | Cons a (List a)
+\end{verbatim}
+
+Let's turn two arguments of \texttt{Cons} into single pair:
+
+\begin{verbatim}
+data List a = Nil | Cons (a, List a)
+\end{verbatim}
+
+\texttt{(a,)} is as functor, let's factor it out:
+
+\begin{verbatim}
+data ListF f a = Nil | Cons (f (ListF f a))
+type List a = ListF (a,) a
+\end{verbatim}
+
+\texttt{ListF} is very similar to \texttt{Free}.
+
+\begin{verbatim}
+data ListF f a = Nil    | Cons   (f (ListF f a))
+data Free  f a = Pure a | Impure (f (Free  f a))
+\end{verbatim}
+
+You can think of \texttt{Free} as a tree. \texttt{Pure} values are
+the leaves, \texttt{Impure} are the nodes. Nodes have such a degree
+of branching as many ``holes'' there are in the \texttt{f} constructor
+contained within them. \texttt{ma \textgreater\textgreater= f} replaces
+all leaves in \texttt{ma} with the results of application of \texttt{f}.
+\end{frame}
+
+\begin{frame}{Free monad: efficiency problems}
+\protect\hypertarget{free-monad-efficiency-problems}{}
+Due to the ``tree-like'' structure of \texttt{Free}, the complexity of a
+single \texttt{\textgreater\textgreater=} operation is linear with respect
+to the size of the program (analogous to adding an element at the end of
+the list). Thus construction of the entire program has quadratic
+complexity.
+\end{frame}
+
+\begin{frame}{Digression: Church encoding}
+\protect\hypertarget{digression-church-encoding}{}
+
+Any algebraic data type can be encoded as a function:
+\begin{itemize}
+  \item the result of the function is any (polymorphic) type \texttt{r}
+  \item this function has as many arguments as there are constructors in the type
+  \item each of these arguments is a function receiving the same arguments as its corresponding constructor
+  \item the result of each of the arguments is the type \texttt{r}
+  \item in particular, if the constructor has zero parameters, the argument is a single value of type \texttt{r}
+  \item recursive arguments in constructors are replaced by \texttt{r}
+\end{itemize}
+
+\end{frame}
+
+\begin{frame}[fragile]{Digression: Church encoding continued}
+\protect\hypertarget{digression-church-encoding-continued}{}
+
+\begin{verbatim}
+data Bool = False | True
+type ChurchBool = forall r. r -> r -> r
+toChurch :: Bool -> ChurchBool
+toChurch = \case
+  False -> \onFalse onTrue -> onFalse
+  True  -> \onFalse onTrue -> onTrue
+fromChurch :: ChurchBool -> Bool
+fromChurch f = f False True
+
+data Either a b = Left a | Right b
+type ChurchEither a b = forall r. (a -> r) -> (b -> r) -> r
+toChurch :: Either a b -> ChurchEither a b
+toChurch = \case
+  Left a  -> \onLeft onRight -> onLeft a
+  Right b -> \onLeft onRight -> onRight b
+fromChurch :: ChurchEither a b -> Either a b
+fromChurch f = f Left Right
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Digression: Church encoding continued further}
+\protect\hypertarget{digression-church-encoding-continued-further}{}
+
+\begin{verbatim}
+data List a = Cons a (List a) | Nil
+type ChurchList a = forall r. (a -> r -> r) -> r -> r
+toChurch :: List a -> ChurchList a
+toChurch = \case
+  Cons a lst -> \onCons onNil -> onCons a ((toChurch lst) onCons onNil)
+  Nil        -> \onCons onNil -> onNil
+fromChurch :: ChurchList a -> List a
+fromChurch f = f (:) []
+\end{verbatim}
+\end{frame}
+
+\begin{frame}[fragile]{Free monad: efficiency problems continued}
+\protect\hypertarget{free-monad-efficiency-problems-continued}{}
+Using Church encoding for \texttt{Free} elliminates quadratic complexity:
+
+\begin{verbatim}
+newtype ChurchFree f a =
+  ChurchFree { runChurch :: forall r. (a -> r) -> (f r -> r) -> r }
+
+instance Monad (ChurchFree f) where
+  ChurchFree m >>= f = ChurchFree (\kp kf -> m (\a -> runChurch (f a) kp kf) kf)
+\end{verbatim}
+\end{frame}
+
+\end{document}
